@@ -308,3 +308,48 @@ test("#5220 T6: deduped markers → re-request WITHOUT an empty assistant frame 
         globalThis.fetch = orig;
     }
 });
+
+// #5604: the recovery receipt is assistant-role by design (#5220 cache invariant —
+// the client echoes the streamed markers back as assistant content), so a failed-only
+// round's re-request ENDED ON AN ASSISTANT TURN. Anthropic rejects that shape outright
+// ("final assistant content cannot end with trailing whitespace" / "assistant message
+// prefill not supported"), the client gets a 400 and a subagent dies with "Agent
+// terminated early due to an API error". The fix caps the re-request with a thin user
+// nudge so it always ends on a user turn. This test pins the final-message role — the
+// existing T1/T6 only asserted the ❌ bytes ride upstream, never which role ends the body.
+test("#5604: failed-only re-request ENDS ON A USER TURN (no assistant prefill)", async () => {
+    let n = 0;
+    const bodies: string[] = [];
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async (_u: unknown, init?: RequestInit) => {
+        n++;
+        if (init?.body) bodies.push(String(init.body));
+        return new Response(NATURAL_END_ROUND, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }) as typeof fetch;
+    try {
+        const ctx = withRefs(makeCtx([
+            textMsg("u1", "user", "do the task"),
+            textMsg("a1", "assistant", "working on it"),
+        ]));
+        // invalid refs → applyRanges returns FAILED, no block created
+        const round1 = [
+            sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+            fcEvents(0, "call_c5604", "compress", JSON.stringify({ content: [{ startId: "b99", endId: "b99", summary: "x".repeat(60) }] })),
+            COMPLETED,
+        ].join("");
+        await drain(
+            new Response(round1, { status: 200 }).body!,
+            ctx,
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.equal(n, 1, "first-time failure re-requests once");
+        const parsed = JSON.parse(bodies[0]!) as { input: Array<{ type?: string; role?: string }> };
+        const msgs = parsed.input.filter((it) => it.type === "message");
+        assert.ok(msgs.length >= 2, `re-request carries the base history plus the cap, got ${msgs.length} message(s)`);
+        assert.equal(msgs[msgs.length - 1]!.role, "user", "the re-request ENDS on a user turn — never an assistant prefill (#5604)");
+        assert.ok(assistantTexts(bodies[0]!).some((t) => t.includes("❌")), "the assistant receipt still carries the streamed marker bytes (#5220 cache invariant intact)");
+    } finally {
+        globalThis.fetch = orig;
+    }
+});
